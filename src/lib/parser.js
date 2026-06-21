@@ -2,6 +2,9 @@ import * as XLSX from 'xlsx';
 
 /**
  * Flexible Parser for Public Company Financial Statements
+ * Supports Thai financial statement CSV/Excel with mixed column layouts:
+ * - Main account names in col A
+ * - Sub-account names in col B or C (indented)
  */
 
 export const STATEMENT_TYPES = {
@@ -46,15 +49,6 @@ function detectStatementType(text) {
   return 'unknown';
 }
 
-function detectScope(text) {
-  if (!text) return 'consolidated';
-  const t = String(text).toLowerCase();
-  for (const [key, keywords] of Object.entries(PERIOD_SCOPES)) {
-    if (keywords.some(k => t.includes(k))) return key;
-  }
-  return 'consolidated';
-}
-
 function detectUnit(text) {
   if (!text) return { unit: 'baht', multiplier: 1 };
   const t = String(text).toLowerCase();
@@ -64,6 +58,7 @@ function detectUnit(text) {
 }
 
 function extractPeriodInfo(text) {
+  if (!text) return null;
   const t = String(text).toUpperCase().replace(/,/g, '').trim();
 
   let year = null;
@@ -84,10 +79,10 @@ function extractPeriodInfo(text) {
   if (year > 2500) year -= 543;
 
   let period_type = 'FY';
-  if (t.includes('Q1') || t.includes('ไตรมาส 1') || t.match(/ไตรมาสที่\s*1/)) period_type = 'Q1';
-  else if (t.includes('Q2') || t.includes('ไตรมาส 2') || t.match(/ไตรมาสที่\s*2/)) period_type = 'Q2';
-  else if (t.includes('Q3') || t.includes('ไตรมาส 3') || t.match(/ไตรมาสที่\s*3/)) period_type = 'Q3';
-  else if (t.includes('Q4') || t.includes('ไตรมาส 4') || t.match(/ไตรมาสที่\s*4/)) period_type = 'Q4';
+  if (t.includes('Q1') || t.match(/ไตรมาส(ที่)?\s*1/)) period_type = 'Q1';
+  else if (t.includes('Q2') || t.match(/ไตรมาส(ที่)?\s*2/)) period_type = 'Q2';
+  else if (t.includes('Q3') || t.match(/ไตรมาส(ที่)?\s*3/)) period_type = 'Q3';
+  else if (t.includes('Q4') || t.match(/ไตรมาส(ที่)?\s*4/)) period_type = 'Q4';
   else if (t.includes('6M') || t.includes('6 เดือน')) period_type = '6M';
   else if (t.includes('9M') || t.includes('9 เดือน')) period_type = '9M';
 
@@ -102,49 +97,31 @@ function autoMapAccount(accountName) {
   for (const [group, keywords] of Object.entries(CORE_GROUPS)) {
     for (const keyword of keywords) {
       const kw = keyword.toLowerCase().replace(/\s+/g, '');
-      if (t === kw) {
-        return { group, confidence: 0.95 };
-      }
-      if (t.includes(kw)) {
-        bestMatch = group;
-        confidence = 0.75;
-      }
+      if (t === kw) return { group, confidence: 0.95 };
+      if (t.includes(kw)) { bestMatch = group; confidence = 0.75; }
     }
   }
-  return { group: bestMatch, confidence: confidence };
+  return { group: bestMatch, confidence };
 }
 
 /**
- * FIX: Dynamically find which column contains account names (text labels).
- * Thai financial statements often have blank col A (note refs), with
- * account names in col B or C.
+ * FIX: Per-row account name detection.
+ * Thai financial statements use col A for main headings and col B/C for
+ * indented sub-items. We scan left-to-right per row, skipping value columns,
+ * and take the first meaningful text cell as the account name.
  */
-function findLabelCol(json, startRow, yearCols) {
-  const yearColSet = new Set(yearCols.map(y => y.colIdx));
-  const colTextCount = {};
-  const limit = Math.min(json.length, startRow + 80);
-
-  for (let i = startRow; i < limit; i++) {
-    const row = json[i];
-    if (!row) continue;
-    for (let j = 0; j < Math.min(row.length, 8); j++) {
-      if (yearColSet.has(j)) continue;
-      const cell = row[j];
-      if (typeof cell === 'string' && cell.trim().length > 2 && isNaN(Number(cell.replace(/,/g, '')))) {
-        colTextCount[j] = (colTextCount[j] || 0) + 1;
-      }
-    }
+function findAccountName(row, yearColSet) {
+  for (let c = 0; c < Math.min(row.length, 6); c++) {
+    if (yearColSet.has(c)) continue;
+    const cell = row[c];
+    if (!cell || typeof cell !== 'string') continue;
+    const trimmed = cell.trim();
+    // Skip very short strings (like note refs "1", "23") and pure numbers
+    if (trimmed.length <= 1) continue;
+    if (!isNaN(Number(trimmed.replace(/,/g, '')))) continue;
+    return trimmed;
   }
-
-  let best = 0, bestCount = 0;
-  for (const [col, count] of Object.entries(colTextCount)) {
-    const c = parseInt(col);
-    if (count > bestCount || (count === bestCount && c < best)) {
-      bestCount = count;
-      best = c;
-    }
-  }
-  return best;
+  return null;
 }
 
 export async function parseFinancialFile(file, companyId) {
@@ -170,22 +147,17 @@ export async function parseFinancialFile(file, companyId) {
             const row = json[i];
             if (!row) continue;
             const rowText = row.filter(Boolean).join(' ');
-
             if (currentStatementType === 'unknown') {
-              const detected = detectStatementType(rowText);
-              if (detected !== 'unknown') currentStatementType = detected;
+              const d = detectStatementType(rowText);
+              if (d !== 'unknown') currentStatementType = d;
             }
-
-            const detectedUnit = detectUnit(rowText);
-            if (detectedUnit.multiplier !== 1) unitInfo = detectedUnit;
-
-            if (rowText.includes('งบการเงินรวม') || rowText.includes('รวม')) {
-              currentScope = 'consolidated';
-            } else if (rowText.includes('เฉพาะกิจการ')) {
-              currentScope = 'separate';
-            }
+            const du = detectUnit(rowText);
+            if (du.multiplier !== 1) unitInfo = du;
+            if (rowText.includes('งบการเงินรวม') || rowText.includes('รวม')) currentScope = 'consolidated';
+            else if (rowText.includes('เฉพาะกิจการ')) currentScope = 'separate';
           }
 
+          // Find header row containing year info
           let headerRowIdx = -1;
           let yearColumns = [];
 
@@ -193,57 +165,57 @@ export async function parseFinancialFile(file, companyId) {
             const row = json[i];
             if (!row) continue;
             for (let j = 0; j < row.length; j++) {
-              const cell = row[j];
-              const periodInfo = extractPeriodInfo(cell);
-              if (periodInfo) {
+              const p = extractPeriodInfo(row[j]);
+              if (p) {
                 if (headerRowIdx === -1 || headerRowIdx === i) {
                   headerRowIdx = i;
-                  yearColumns.push({ colIdx: j, year: periodInfo.year, period_type: periodInfo.period_type });
+                  // Avoid duplicate years in same column set
+                  if (!yearColumns.some(y => y.year === p.year && y.period_type === p.period_type)) {
+                    yearColumns.push({ colIdx: j, year: p.year, period_type: p.period_type });
+                  }
                 }
               }
             }
             if (headerRowIdx !== -1) break;
           }
 
+          // Fallback: find first row with numeric values and a text label anywhere
           if (headerRowIdx === -1 || yearColumns.length === 0) {
             for (let i = 0; i < contextRows; i++) {
               const row = json[i];
               if (!row) continue;
               let tempCols = [];
-              let validNumCount = 0;
               for (let j = 0; j < row.length; j++) {
                 const val = String(row[j] || '').replace(/,/g, '').replace(/[()]/g, '');
                 if (val && !isNaN(parseFloat(val)) && parseFloat(val) !== 0) {
-                  validNumCount++;
-                  tempCols.push({ colIdx: j, year: new Date().getFullYear() - (tempCols.length), period_type: 'FY' });
+                  tempCols.push({ colIdx: j, year: new Date().getFullYear() - tempCols.length, period_type: 'FY' });
                 }
               }
-              const hasTextLabel = row.some((cell, idx) =>
-                idx < 5 && typeof cell === 'string' && cell.trim().length > 1 && isNaN(Number(String(cell).replace(/,/g,'')))
+              const hasLabel = row.some((cell, idx) =>
+                idx < 5 && typeof cell === 'string' && cell.trim().length > 1 &&
+                isNaN(Number(String(cell).replace(/,/g, '')))
               );
-              if (validNumCount >= 1 && hasTextLabel) {
+              if (tempCols.length >= 1 && hasLabel) {
                 headerRowIdx = i > 0 ? i - 1 : 0;
                 yearColumns = tempCols;
                 break;
               }
             }
-
             if (yearColumns.length === 0) {
-              console.warn(`Could not detect years or numeric data in sheet "${sheetName}"`);
+              console.warn(`No data found in sheet "${sheetName}"`);
               continue;
             }
           }
 
-          const labelCol = findLabelCol(json, headerRowIdx + 1, yearColumns);
+          const yearColSet = new Set(yearColumns.map(y => y.colIdx));
 
+          // Parse data rows — use per-row account name detection
           for (let i = headerRowIdx + 1; i < json.length; i++) {
             const row = json[i];
             if (!row) continue;
 
-            const rawAccountName = row[labelCol];
-
-            if (!rawAccountName || typeof rawAccountName !== 'string' || rawAccountName.trim() === '') continue;
-            if (rawAccountName.trim().length <= 1) continue;
+            const rawAccountName = findAccountName(row, yearColSet);
+            if (!rawAccountName) continue;
 
             const mapping = autoMapAccount(rawAccountName);
 
@@ -255,35 +227,30 @@ export async function parseFinancialFile(file, companyId) {
               let strVal = String(rawAmount).trim();
               if (strVal.startsWith('(') && strVal.endsWith(')')) {
                 isNegative = true;
-                strVal = strVal.substring(1, strVal.length - 1);
+                strVal = strVal.slice(1, -1);
               }
-
               strVal = strVal.replace(/,/g, '');
-              let numericAmount = parseFloat(strVal);
+              const numericAmount = isNegative ? -Math.abs(parseFloat(strVal)) : parseFloat(strVal);
               if (isNaN(numericAmount)) continue;
-
-              if (isNegative) numericAmount = -Math.abs(numericAmount);
-
-              const normalizedAmount = numericAmount * unitInfo.multiplier;
 
               results.push({
                 id: crypto.randomUUID(),
                 company_id: companyId,
                 fiscal_year: year,
-                period_type: period_type,
+                period_type,
                 period: period_type,
                 statement_scope: currentScope,
                 statement_type: currentStatementType !== 'unknown' ? currentStatementType : 'balance_sheet',
-                account_name: rawAccountName.trim(),
+                account_name: rawAccountName,
                 account_group: mapping.group,
                 account_subgroup: null,
                 industry_metric: null,
                 note: null,
                 original_amount: numericAmount,
                 original_unit: unitInfo.unit,
-                amount: normalizedAmount,
+                amount: numericAmount * unitInfo.multiplier,
                 normalized_unit: 'baht',
-                raw_account_name: rawAccountName.trim(),
+                raw_account_name: rawAccountName,
                 raw_amount: rawAmount,
                 raw_unit: unitInfo.unit,
                 source_sheet: sheetName,
